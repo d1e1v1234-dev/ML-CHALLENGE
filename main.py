@@ -43,9 +43,17 @@ def process_pipeline(split, loader, preprocessor, blocker, feat_extractor, model
         df_preds = model.predict(df_features)
         return df_cands, df_preds, df_s1
 
+import argparse
+
 def main():
-    project_root = Path("/Users/devpopli/AMAZON ML/code/business_entity_resolution")
-    dataset_dir = "/Users/devpopli/AMAZON ML/student_resource/dataset"
+    parser = argparse.ArgumentParser(description="Run Business Entity Resolution Pipeline")
+    parser.add_argument('--dataset_dir', type=str, default="/Users/devpopli/AMAZON ML/student_resource/dataset", help="Path to the dataset directory")
+    parser.add_argument('--validate_script', type=str, default="/Users/devpopli/AMAZON ML/student_resource/utils/validate_submission.py", help="Path to validate_submission.py")
+    parser.add_argument('--project_root', type=str, default="/Users/devpopli/AMAZON ML/code/business_entity_resolution", help="Path to project root directory")
+    args = parser.parse_args()
+
+    project_root = Path(args.project_root)
+    dataset_dir = args.dataset_dir
     output_dir = project_root / "output"
     
     loader = DataLoader(dataset_dir)
@@ -53,9 +61,13 @@ def main():
     blocker = Blocker(top_k=5) # Reduced top_k for speed
     feat_extractor = FeatureExtractor()
     model = EntityMatchingModel()
+    
+    # Create output dir if it doesn't exist
+    output_dir.mkdir(parents=True, exist_ok=True)
     postprocessor = Postprocessor(str(output_dir))
     
     gt_path = os.path.join(dataset_dir, "train", "train_ground_truth.tsv")
+    
     
     # Train
     process_pipeline("train", loader, preprocessor, blocker, feat_extractor, model, is_train=True, gt_path=gt_path)
@@ -71,7 +83,7 @@ def main():
     
     # Validate
     logger.info("--- RUNNING VALIDATION SCRIPT ---")
-    validate_script = "/Users/devpopli/AMAZON ML/student_resource/utils/validate_submission.py"
+    validate_script = args.validate_script
     cmd = [
         "python3", validate_script,
         "--matching", str(output_dir / "matching_results.tsv"),
