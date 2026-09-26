@@ -37,7 +37,7 @@ class Blocker:
          matrices at any point.
     """
 
-    def __init__(self, top_k=15, max_key_bucket=60, max_row_bucket=60,
+    def __init__(self, top_k=15, max_key_bucket=35, max_row_bucket=60,
                  fit_sample_size=200_000, max_features=20_000):
         self.top_k = top_k
         self.max_key_bucket = max_key_bucket
@@ -136,7 +136,11 @@ class Blocker:
                 )
                 keep_local = np.array([idx for (_, _, idx) in ranked], dtype=np.int64)
                 arr = arr[keep_local]
+                del choices, ranked, keep_local
             s1_buckets[i] = arr
+
+            if i % 200_000 == 0 and i > 0:
+                gc.collect()
 
         if n_no_bucket:
             _log_step(f"{n_no_bucket:,}/{len(df_s1):,} S1 records had no candidate bucket (will be singletons).")
