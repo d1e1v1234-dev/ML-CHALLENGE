@@ -5,6 +5,7 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from collections import defaultdict
 from tqdm import tqdm
+from rapidfuzz import process, fuzz
 import logging
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,7 @@ class Blocker:
          matrices at any point.
     """
 
-    def __init__(self, top_k=15, max_key_bucket=40, max_row_bucket=60,
+    def __init__(self, top_k=15, max_key_bucket=60, max_row_bucket=60,
                  fit_sample_size=200_000, max_features=20_000):
         self.top_k = top_k
         self.max_key_bucket = max_key_bucket
@@ -106,7 +107,15 @@ class Blocker:
 
         cand_index = self._build_capped_inverted_index(cand_names, cand_addrs, rng)
 
+        # Raw text arrays, reused for cheap fuzzy-ranking when a row's bucket needs capping
+        s1_texts_arr = s1_texts.values
+        cand_texts_arr = cand_texts.values
+
         # --- Resolve each S1 row's (per-key AND per-row capped) bucket ---
+        # When a row's union bucket exceeds max_row_bucket, keep the candidates most
+        # likely to be a real match (by cheap fuzzy string score), NOT a random subset.
+        # Random capping was discarding true matches before they ever reached the
+        # TF-IDF scoring stage -- this is the fix for that.
         s1_buckets = [None] * len(df_s1)
         n_no_bucket = 0
         n_row_capped = 0
@@ -121,8 +130,12 @@ class Blocker:
             arr = np.fromiter(bucket, dtype=np.int32)
             if len(arr) > self.max_row_bucket:
                 n_row_capped += 1
-                keep = rng.choice(len(arr), size=self.max_row_bucket, replace=False)
-                arr = arr[keep]
+                choices = cand_texts_arr[arr]
+                ranked = process.extract(
+                    s1_texts_arr[i], choices, scorer=fuzz.ratio, limit=self.max_row_bucket
+                )
+                keep_local = np.array([idx for (_, _, idx) in ranked], dtype=np.int64)
+                arr = arr[keep_local]
             s1_buckets[i] = arr
 
         if n_no_bucket:
