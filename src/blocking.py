@@ -1,3 +1,4 @@
+import gc
 import time
 import pandas as pd
 import numpy as np
@@ -18,29 +19,28 @@ def _log_step(msg: str):
 
 class Blocker:
     """
-    Fully vectorized, memory-safe blocking:
+    Correct, memory-safe blocking:
       1. Cheap key-based inverted index on RAW TEXT buckets each S1 record with a
-         small set of plausible candidates. Oversized key buckets are capped by
-         random subsampling BEFORE any vectorization.
-      2. The vectorizer is fit on a SAMPLE of texts to avoid the vocabulary-build
-         memory spike on tens of millions of documents.
-      3. All (s1_row, candidate) bucket pairs are flattened into ONE pair of numpy
-         arrays and sorted by candidate index -- no per-chunk Python dict/list of
-         tuples is ever built (that was the bug in the previous version: it
-         materialized a near-full row x chunk structure since buckets scatter
-         across all chunks, not just a few).
-      4. Candidates are transformed in chunks; each chunk's similarity scores are
-         computed in ONE vectorized sparse operation (row-aligned multiply + sum),
-         not a per-row loop.
-      5. Top-k selection per S1 row is done with a single vectorized
-         sort + groupby().cumcount(), not a Python loop over rows.
+         small set of plausible candidates. Both per-key AND per-row (post-union)
+         caps bound how many candidates any single S1 row can ever reference.
+      2. The vectorizer is fit on a SAMPLE of texts (avoids the vocabulary-build
+         memory spike on millions of documents).
+      3. ONLY the candidates that appear in at least one bucket are transformed
+         (via np.unique on the referenced indices) -- not the full candidate pool,
+         and NOT via any duplicated fancy-row-indexing trick. This avoids the
+         integer-overflow / duplication bug in the previous chunked-multiply design,
+         where selecting a sparse matrix by a repeated-index array silently
+         duplicated each row's nonzeros once per repetition.
+      4. Each S1 row then does exactly ONE small, cheap dot product against just
+         its own (<= max_row_bucket) candidate vectors -- no huge intermediate
+         matrices at any point.
     """
 
-    def __init__(self, top_k=15, max_key_bucket=100, cand_chunk_size=300_000,
+    def __init__(self, top_k=15, max_key_bucket=40, max_row_bucket=60,
                  fit_sample_size=200_000, max_features=20_000):
         self.top_k = top_k
         self.max_key_bucket = max_key_bucket
-        self.cand_chunk_size = cand_chunk_size
+        self.max_row_bucket = max_row_bucket
         self.fit_sample_size = fit_sample_size
         self.vectorizer = TfidfVectorizer(
             analyzer='char', ngram_range=(2, 4), min_df=2, max_df=0.8,
@@ -72,7 +72,7 @@ class Blocker:
                 n_capped += 1
                 keep = rng.choice(len(idxs), size=self.max_key_bucket, replace=False)
                 index[k] = [idxs[j] for j in keep]
-        _log_step(f"Inverted index built: {len(index)} keys, {n_capped} capped at {self.max_key_bucket}")
+        _log_step(f"Inverted index built: {len(index):,} keys, {n_capped:,} capped at {self.max_key_bucket}")
         return index
 
     def fit_transform(self, df_s1: pd.DataFrame, df_candidates: pd.DataFrame):
@@ -102,103 +102,77 @@ class Blocker:
 
         t0 = time.time()
         X_s1 = self.vectorizer.transform(s1_texts)
-        _log_step(f"Transformed {X_s1.shape[0]:,} S1 rows in {time.time() - t0:.1f}s "
-                   f"(nnz={X_s1.nnz:,})")
+        _log_step(f"Transformed {X_s1.shape[0]:,} S1 rows in {time.time() - t0:.1f}s (nnz={X_s1.nnz:,})")
 
         cand_index = self._build_capped_inverted_index(cand_names, cand_addrs, rng)
 
-        # --- Build ONE flat (s1_row_idx, global_cand_idx) pair array ---
-        row_parts, cand_parts = [], []
+        # --- Resolve each S1 row's (per-key AND per-row capped) bucket ---
+        s1_buckets = [None] * len(df_s1)
         n_no_bucket = 0
+        n_row_capped = 0
         for i in tqdm(range(len(df_s1)), desc="Resolving S1 buckets", mininterval=1.0):
             keys = self._make_keys(s1_names[i], s1_addrs[i])
             bucket = set()
             for k in keys:
                 bucket.update(cand_index.get(k, []))
-            if bucket:
-                arr = np.fromiter(bucket, dtype=np.int64)
-                cand_parts.append(arr)
-                row_parts.append(np.full(len(arr), i, dtype=np.int64))
-            else:
+            if not bucket:
                 n_no_bucket += 1
+                continue
+            arr = np.fromiter(bucket, dtype=np.int32)
+            if len(arr) > self.max_row_bucket:
+                n_row_capped += 1
+                keep = rng.choice(len(arr), size=self.max_row_bucket, replace=False)
+                arr = arr[keep]
+            s1_buckets[i] = arr
 
         if n_no_bucket:
             _log_step(f"{n_no_bucket:,}/{len(df_s1):,} S1 records had no candidate bucket (will be singletons).")
+        if n_row_capped:
+            _log_step(f"{n_row_capped:,}/{len(df_s1):,} S1 rows had their union bucket capped at {self.max_row_bucket}.")
 
-        if not cand_parts:
+        # --- Transform ONLY the candidates actually referenced by some bucket ---
+        non_empty = [b for b in s1_buckets if b is not None]
+        if not non_empty:
             return pd.DataFrame({
                 'source1_entity_id': s1_ids,
                 'candidate_entity_ids': [""] * len(s1_ids)
             })
 
-        flat_rows = np.concatenate(row_parts)
-        flat_cands = np.concatenate(cand_parts)
-        del row_parts, cand_parts
-        _log_step(f"Total (S1, candidate) pairs to score: {len(flat_rows):,} "
-                   f"(~{len(flat_rows) / max(len(df_s1) - n_no_bucket, 1):.0f} avg per matched S1 row)")
-
-        # Sort by candidate global index -> pairs touching the same chunk are contiguous
-        order = np.argsort(flat_cands, kind='stable')
-        flat_rows = flat_rows[order]
-        flat_cands = flat_cands[order]
-        del order
-
-        n_cand = len(df_candidates)
-        n_chunks = int(np.ceil(n_cand / self.cand_chunk_size))
-        boundaries = np.searchsorted(
-            flat_cands, np.arange(0, n_cand + self.cand_chunk_size, self.cand_chunk_size)
-        )
-
-        all_scores = np.empty(len(flat_cands), dtype=np.float32)
-        total_pairs = len(flat_cands)
-        pairs_done = 0
-
-        chunk_bar = tqdm(range(n_chunks), desc="Candidate chunks")
-        for c in chunk_bar:
-            lo, hi = boundaries[c], boundaries[c + 1]
-            if hi <= lo:
-                continue
-            start = c * self.cand_chunk_size
-            end = min(start + self.cand_chunk_size, n_cand)
-            X_chunk = self.vectorizer.transform(cand_texts.iloc[start:end])
-
-            rows_slice = flat_rows[lo:hi]
-            local_idx = flat_cands[lo:hi] - start
-
-            X_s1_sel = X_s1[rows_slice]
-            X_chunk_sel = X_chunk[local_idx]
-            sims = np.asarray(X_s1_sel.multiply(X_chunk_sel).sum(axis=1)).ravel()
-            all_scores[lo:hi] = sims
-
-            pairs_done += (hi - lo)
-            chunk_bar.set_postfix({
-                'pairs': f"{pairs_done:,}/{total_pairs:,}",
-                'pairs_in_chunk': hi - lo
-            })
-
-            del X_chunk, X_s1_sel, X_chunk_sel
-        _log_step(f"Finished scoring all {total_pairs:,} candidate pairs across {n_chunks} chunks")
-
-        # --- Vectorized top-k per S1 row: no Python loop over rows ---
-        _log_step("Selecting top-k candidates per S1 row (sort + groupby)...")
+        referenced = np.unique(np.concatenate(non_empty))
+        _log_step(f"Transforming {len(referenced):,} uniquely-referenced candidates "
+                  f"(out of {len(df_candidates):,} total in this country)...")
         t0 = time.time()
-        df_pairs = pd.DataFrame({'s1_row': flat_rows, 'cand_idx': flat_cands, 'score': all_scores})
-        del flat_rows, flat_cands, all_scores
+        X_cand_ref = self.vectorizer.transform(cand_texts.iloc[referenced])
+        _log_step(f"Candidate transform done in {time.time() - t0:.1f}s (nnz={X_cand_ref.nnz:,})")
 
-        df_pairs.sort_values(['s1_row', 'score'], ascending=[True, False], inplace=True)
-        df_pairs['rank'] = df_pairs.groupby('s1_row', sort=False).cumcount()
-        df_top = df_pairs[df_pairs['rank'] < self.top_k].copy()
-        del df_pairs
+        # Map global candidate index -> local row position in X_cand_ref
+        local_pos = np.full(len(df_candidates), -1, dtype=np.int64)
+        local_pos[referenced] = np.arange(len(referenced))
+        del referenced, non_empty
+        gc.collect()
 
-        df_top['cand_entity_id'] = cand_ids[df_top['cand_idx'].values]
-        grouped = df_top.groupby('s1_row', sort=False)['cand_entity_id'].apply(lambda x: ",".join(x))
-        result_map = grouped.to_dict()
-        _log_step(f"Top-k selection done in {time.time() - t0:.1f}s")
+        # --- One small dot product per S1 row: no duplicated matrices, no chunking needed ---
+        candidate_pairs = []
+        t0 = time.time()
+        for i in tqdm(range(len(df_s1)), desc="Scoring S1 buckets", mininterval=1.0):
+            bucket = s1_buckets[i]
+            if bucket is None:
+                candidate_pairs.append({'source1_entity_id': s1_ids[i], 'candidate_entity_ids': ""})
+                continue
 
-        candidate_pairs = [
-            {'source1_entity_id': s1_ids[i], 'candidate_entity_ids': result_map.get(i, "")}
-            for i in range(len(df_s1))
-        ]
+            local_idx = local_pos[bucket]
+            sims = X_s1[i].dot(X_cand_ref[local_idx].T).toarray().ravel()
+
+            k = min(self.top_k, len(sims))
+            top_rel = np.argpartition(-sims, k - 1)[:k]
+            top_rel = top_rel[np.argsort(-sims[top_rel])]
+            matched_ids = cand_ids[bucket[top_rel]]
+            candidate_pairs.append({
+                'source1_entity_id': s1_ids[i],
+                'candidate_entity_ids': ",".join(matched_ids)
+            })
+        _log_step(f"Scored all S1 rows in {time.time() - t0:.1f}s")
+
         return pd.DataFrame(candidate_pairs)
 
     def generate_candidate_pairs(self, df_s1: pd.DataFrame, df_s2: pd.DataFrame, df_s3: pd.DataFrame):
@@ -222,7 +196,7 @@ class Blocker:
             pairs_df = blocker.fit_transform(s1_subset, cand_subset)
             all_candidate_pairs.extend(pairs_df.to_dict('records'))
             del blocker
-            _log_step(f"[Country {country_num}/{len(countries)}] '{country}' done in {time.time() - t0:.1f}s "
-                       f"({country_num}/{len(countries)} countries complete)")
+            gc.collect()
+            _log_step(f"[Country {country_num}/{len(countries)}] '{country}' done in {time.time() - t0:.1f}s")
 
         return pd.DataFrame(all_candidate_pairs)
