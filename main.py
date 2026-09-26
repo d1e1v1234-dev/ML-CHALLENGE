@@ -58,7 +58,7 @@ def main():
     
     loader = DataLoader(dataset_dir)
     preprocessor = Preprocessor()
-    blocker = Blocker(top_k=5) # Reduced top_k for speed
+    blocker = Blocker(top_k=15)  # bumped from 5 -- was too tight once blocking stabilized
     feat_extractor = FeatureExtractor()
     model = EntityMatchingModel()
     
